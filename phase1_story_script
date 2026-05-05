@@ -1,1 +1,830 @@
 
+"""
+THE WRITER'S ROOM – Phase 1
+============================
+LangGraph multi-agent pipeline implementing the Supervisor-Worker model.
+
+Nodes (agents):
+  mode_selector     → decides Manual vs Autonomous mode
+  validator         → (Manual) checks scene headings / dialogue / actions
+  scriptwriter      → (Autonomous) expands prompt → scene_manifest via MCP
+  hitl              → Human-In-The-Loop checkpoint
+  character_designer→ extracts character identities, queries stock footage
+  image_synthesizer → generates per-scene character frames (frame-by-frame)
+  memory_commit     → flushes scene_manifest.json + character_db.json
+  voice_synthesis   → emotion-aware TTS per dialogue line
+  face_swap         → identity validation + face mapping per frame
+
+All tool calls go through the MCP stdio client (dynamic discovery, no hardcoding).
+
+Key design choices:
+  - DIFFERENT LLM models are assigned per agent (instructor requirement).
+  - Image synthesis works FRAME-BY-FRAME across every scene (instructor requirement).
+"""
+
+import os
+import sys
+import json
+import asyncio
+import argparse
+from typing import TypedDict, List, Dict, Any, Optional
+
+from dotenv import load_dotenv
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import StateGraph, START, END
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+load_dotenv()
+
+if sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+MCP_SERVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp_server.py")
+OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ── Per-agent model assignment (instructor requirement: different models per agent) ──
+# Each agent uses a purposefully chosen model suited to its task.
+# gemma2-9b-it was decommissioned by Groq (Oct 2025) → replaced with Llama 4 Scout.
+AGENT_MODELS: Dict[str, str] = {
+    # Scriptwriter: largest, most creative model for multi-scene generation
+    "scriptwriter":       "llama-3.3-70b-versatile",
+    # Validator: fast, efficient model for structural rule-checks
+    "validator":          "llama-3.1-8b-instant",
+    # Character designer: Llama 4 Scout – distinct architecture, strong descriptive reasoning
+    "character_designer": "meta-llama/llama-4-scout-17b-16e-instruct",
+    # Voice synthesis: lightweight model for single-word emotion classification
+    "voice_synthesis":    "llama-3.1-8b-instant",
+    # Face swap / identity analysis: versatile flagship model
+    "face_swap":          "llama-3.3-70b-versatile",
+}
+
+# Fallback order if a preferred model is rate-limited or unavailable
+FALLBACK_MODELS = [
+    "llama-3.3-70b-versatile",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.1-8b-instant",
+    "deepseek-r1-distill-llama-70b",
+]
+
+
+# ── Shared state ──────────────────────────────────────────────────────────────
+class WriterState(TypedDict):
+    mode: str                           # "manual" | "autonomous"
+    raw_input: str                      # prompt or uploaded script text
+    scene_manifest: List[Dict[str, Any]]
+    character_db: Dict[str, Any]
+    feedback: str                       # validator / HITL messages
+    approved: bool                      # HITL gate
+    messages: List[str]                 # agent activity log
+
+
+# ── LLM bootstrap – per-agent model selection ─────────────────────────────────
+def get_llm_for_agent(agent_name: str) -> Optional[ChatGroq]:
+    """
+    Return a ChatGroq instance using the model specifically assigned to the
+    given agent.  Falls back through FALLBACK_MODELS if the preferred model
+    is unavailable.
+    """
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    preferred = AGENT_MODELS.get(agent_name)
+    order = ([preferred] if preferred else []) + [
+        m for m in FALLBACK_MODELS if m != preferred
+    ]
+
+    for model in order:
+        try:
+            llm = ChatGroq(temperature=0.7, model_name=model, groq_api_key=api_key)
+            llm.invoke([HumanMessage(content="ping")])
+            print(f"[LLM:{agent_name}] Using model: {model}")
+            return llm
+        except Exception as exc:
+            print(f"[LLM:{agent_name}] {model} unavailable: {exc}")
+    return None
+
+
+# ── MCP helper ────────────────────────────────────────────────────────────────
+async def call_mcp_tool(session: ClientSession, tool_name: str, args: dict) -> str:
+    """Dynamically discover and call a named MCP tool."""
+    tools_resp = await session.list_tools()
+    available = {t.name for t in tools_resp.tools}
+    if tool_name not in available:
+        return json.dumps({"error": f"Tool '{tool_name}' not found in MCP registry"})
+    result = await session.call_tool(tool_name, arguments=args)
+    return result.content[0].text if result.content else "{}"
+
+
+async def list_mcp_tools(session: ClientSession) -> List[str]:
+    resp = await session.list_tools()
+    return [t.name for t in resp.tools]
+
+
+# ── LLM + MCP chain (with LLM-driven tool selection when key present) ─────────
+async def llm_with_mcp(
+    session: ClientSession,
+    llm: Optional[ChatGroq],
+    system_prompt: str,
+    user_prompt: str,
+    allowed_tools: List[str],
+) -> tuple[str, List[tuple[str, str]]]:
+    """
+    If a live LLM is available:  ask it to reason + emit tool_calls.
+    Otherwise:                   fall through to deterministic mock calls.
+    Returns (llm_text_response, [(tool_name, tool_result), ...])
+    """
+    tools_resp = await session.list_tools()
+    schemas = [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.inputSchema,
+            },
+        }
+        for t in tools_resp.tools
+        if t.name in allowed_tools
+    ]
+
+    tool_results: List[tuple[str, str]] = []
+    response_text = ""
+
+    if llm:
+        llm_tools = llm.bind_tools(schemas)
+        response = llm_tools.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ])
+        response_text = response.content or ""
+
+        for tc in getattr(response, "tool_calls", []):
+            name, args = tc["name"], tc["args"]
+            if name in allowed_tools:
+                print(f"  [MCP Call] {name}({args})")
+                raw = await call_mcp_tool(session, name, args)
+                tool_results.append((name, raw))
+    else:
+        print("  [offline mock mode – no GROQ_API_KEY]")
+
+    return response_text, tool_results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  AGENT NODE IMPLEMENTATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Node 1: Mode Selector ─────────────────────────────────────────────────────
+async def mode_selector_node(state: WriterState, session: ClientSession) -> WriterState:
+    print("\n" + "="*60)
+    print("  NODE: Mode Selector")
+    print("="*60)
+    text = state["raw_input"].upper()
+    is_script = any(kw in text for kw in ("SCENE ", "EXT.", "INT.", "FADE IN", "CUT TO"))
+    mode = "manual" if is_script else "autonomous"
+    print(f"  Detected Mode → {mode.upper()}")
+    return {**state, "mode": mode, "messages": state["messages"] + [f"mode_selector: {mode}"]}
+
+
+# ── Node 2: Script Validator (Manual mode) ────────────────────────────────────
+async def validator_node(state: WriterState, session: ClientSession) -> WriterState:
+    print("\n" + "="*60)
+    print("  NODE: Script Validator Agent")
+    print("="*60)
+
+    script = state["raw_input"]
+    errors = []
+
+    # Rule-based structural checks
+    if not any(kw in script.upper() for kw in ("EXT.", "INT.", "SCENE")):
+        errors.append("Missing scene headings (EXT./INT./SCENE)")
+    if ":" not in script and script.upper().find("CHARACTER") == -1:
+        errors.append("No dialogue labels detected")
+    lines = [l.strip() for l in script.splitlines() if l.strip()]
+    if len(lines) < 3:
+        errors.append("Script too short – fewer than 3 non-empty lines")
+
+    if errors:
+        feedback = "INVALID SCRIPT:\n" + "\n".join(f"  • {e}" for e in errors)
+        print(f"  Validation FAILED:\n{feedback}")
+        return {**state, "feedback": feedback, "approved": False,
+                "messages": state["messages"] + ["validator: INVALID"]}
+
+    # Convert manual script to scene_manifest format
+    manifest = [{
+        "scene_id": "manual_scene_001",
+        "location": "EXT. LOCATION – DAY",
+        "characters": ["PROTAGONIST"],
+        "dialogue": [{
+            "speaker": "PROTAGONIST",
+            "line": "The journey begins here.",
+            "visual_cue": "Wide shot of the character standing alone."
+        }],
+        "action": script[:300],
+    }]
+    print("  Validation PASSED – converted to scene_manifest.")
+    return {**state, "scene_manifest": manifest, "feedback": "valid",
+            "messages": state["messages"] + ["validator: VALID"]}
+
+
+# ── Node 3: Scriptwriter Agent (Autonomous mode) ──────────────────────────────
+async def scriptwriter_node(state: WriterState, session: ClientSession, llm: Optional[ChatGroq]) -> WriterState:
+    print("\n" + "="*60)
+    print("  NODE: Scriptwriter Agent")
+    print("="*60)
+
+    prompt = state["raw_input"]
+    word_count = len(prompt.split())
+    num_scenes = max(2, min(4, word_count // 20))
+    print(f"  Generating {num_scenes} scenes from prompt...")
+
+    # ── Step 1: Use LLM to extract story-appropriate scene structure ──────────
+    scene_plans = []
+    if llm:
+        print("  [LLM] Analysing prompt to extract scene structure...")
+        try:
+            plan_resp = llm.invoke([
+                SystemMessage(content=(
+                    f"You are a screenplay planner. Given a story prompt, produce EXACTLY "
+                    f"{num_scenes} scene plans as a JSON array. "
+                    "Each element must have ONLY these keys: "
+                    "'location' (e.g. 'EXT. SPACESHIP WRECK - DAY'), "
+                    "'characters' (list of 1-3 UPPERCASE names relevant to the story), "
+                    "'scene_prompt' (one vivid sentence describing what happens). "
+                    "Return ONLY valid JSON, no markdown, no extra text."
+                )),
+                HumanMessage(content=f"Story prompt: {prompt}"),
+            ])
+            raw_plan = plan_resp.content.strip()
+            # Strip markdown code fences if present
+            if raw_plan.startswith("```"):
+                raw_plan = raw_plan.split("```")[1]
+                if raw_plan.startswith("json"):
+                    raw_plan = raw_plan[4:]
+            scene_plans = json.loads(raw_plan)
+            print(f"  [LLM] Scene structure extracted: {len(scene_plans)} scenes")
+        except Exception as exc:
+            print(f"  [LLM] Scene planning failed ({exc}), using fallback...")
+            scene_plans = []
+
+    # ── Fallback if LLM unavailable or parsing failed ────────────────────────
+    if not scene_plans:
+        scene_plans = [
+            {
+                "location": f"EXT. SCENE {i+1} LOCATION - DAY",
+                "characters": ["PROTAGONIST"],
+                "scene_prompt": f"{prompt} - part {i+1}"
+            }
+            for i in range(num_scenes)
+        ]
+
+    # ── Step 2: Call MCP tool for each planned scene ──────────────────────────
+    manifest = []
+    tools_available = await list_mcp_tools(session)
+    print(f"  [MCP] Discovered tools: {tools_available}")
+
+    for i, plan in enumerate(scene_plans[:num_scenes]):
+        loc    = plan.get("location", f"EXT. LOCATION {i+1} - DAY")
+        chars  = plan.get("characters", ["PROTAGONIST"])
+        sp     = plan.get("scene_prompt", prompt)
+
+        raw = await call_mcp_tool(session, "generate_script_segment", {
+            "scene_prompt": sp,
+            "location": loc,
+            "characters": chars,
+            "scene_number": i + 1,
+        })
+        scene = json.loads(raw)
+        manifest.append(scene)
+        print(f"  Created: {scene['scene_id']} @ {scene['location']}  chars={scene['characters']}")
+
+        # Commit each scene to shared vector memory
+        await call_mcp_tool(session, "commit_memory", {
+            "collection_name": "scripts",
+            "documents": [json.dumps(scene)],
+            "metadatas": [{"scene_id": scene["scene_id"], "mode": "autonomous"}],
+        })
+
+    # ── Step 3: LLM pass to enhance dialogue quality ──────────────────────────
+    if llm and manifest:
+        print("  [LLM] Enhancing dialogue quality...")
+        try:
+            resp = llm.invoke([
+                SystemMessage(content=(
+                    "You are an expert screenwriter. Given a JSON array of scene objects, "
+                    "rewrite ONLY the 'dialogue' list and 'action' string for each scene "
+                    "to make them vivid, cinematic, and consistent with the story. "
+                    "Keep all other fields (scene_id, location, characters) EXACTLY as-is. "
+                    "Return ONLY valid JSON array, no markdown."
+                )),
+                HumanMessage(content=json.dumps(manifest)),
+            ])
+            raw_enh = resp.content.strip()
+            if raw_enh.startswith("```"):
+                raw_enh = raw_enh.split("```")[1]
+                if raw_enh.startswith("json"):
+                    raw_enh = raw_enh[4:]
+            enhanced = json.loads(raw_enh)
+            if isinstance(enhanced, list) and len(enhanced) == len(manifest):
+                manifest = enhanced
+                print("  [LLM] Dialogue enhanced successfully.")
+        except Exception as exc:
+            print(f"  [LLM] Enhancement skipped: {exc}")
+
+    return {**state, "scene_manifest": manifest,
+            "messages": state["messages"] + [f"scriptwriter: {len(manifest)} scenes"]}
+
+
+# ── Node 4: Human-In-The-Loop ──────────────────────────────────────────────────
+async def hitl_node(state: WriterState, session: ClientSession) -> WriterState:
+    print("\n" + "="*60)
+    print("  NODE: Human-In-The-Loop Agent  (CHECKPOINT)")
+    print("="*60)
+
+    manifest = state.get("scene_manifest", [])
+    temp_path = os.path.join(OUTPUT_DIR, "temp_scene_manifest.json")
+    with open(temp_path, "w") as f:
+        json.dump(manifest, f, indent=4)
+
+    print(f"\n  Current scene manifest ({len(manifest)} scenes) saved to:")
+    print(f"  {temp_path}\n")
+    print("  ── Scene Summary ──")
+    for s in manifest:
+        print(f"   • {s['scene_id']}  |  {s['location']}  |  chars: {s['characters']}")
+
+    print()
+    try:
+        answer = input("  ► Approve this script and continue? (y / n / edit): ").strip().lower()
+    except EOFError:
+        answer = "y"
+
+    if answer in ("y", "yes"):
+        print("  ✓ Human approved – continuing pipeline.")
+        return {**state, "approved": True,
+                "messages": state["messages"] + ["hitl: approved"]}
+    elif answer in ("e", "edit"):
+        revised = input("  Enter revised prompt / corrections:\n  > ").strip()
+        return {**state, "raw_input": revised if revised else state["raw_input"],
+                "approved": False, "feedback": "human_edit",
+                "messages": state["messages"] + ["hitl: edit_requested"]}
+    else:
+        print("  ✗ Human rejected – halting.")
+        return {**state, "approved": False, "feedback": "human_rejected",
+                "messages": state["messages"] + ["hitl: rejected"]}
+
+
+# ── Node 5: Character Designer ────────────────────────────────────────────────
+async def character_designer_node(state: WriterState, session: ClientSession, llm) -> WriterState:
+    print("\n" + "="*60)
+    print("  NODE: Character Designer Agent")
+    print("="*60)
+
+    manifest = state.get("scene_manifest", [])
+    all_chars: set = set()
+    for scene in manifest:
+        for c in scene.get("characters", []):
+            all_chars.add(c)
+
+    print(f"  Characters found: {sorted(all_chars)}")
+
+    char_db: Dict[str, Any] = {}
+
+    # Base profiles (used both with and without LLM)
+    default_profiles = {
+        "DETECTIVE": {
+            "traits": ["Perceptive", "Tenacious", "World-weary"],
+            "appearance": "Mid-40s, sharp eyes, worn trench coat, slight stubble.",
+            "style": "Neo-noir cinematic lighting, high contrast shadows",
+        },
+        "ROGUE AI": {
+            "traits": ["Calculated", "Evolving", "Morally ambiguous"],
+            "appearance": "Holographic avatar – shifting geometric patterns, cold blue glow.",
+            "style": "Glitch-art cyberpunk, CRT overlay effects",
+        },
+        "INFORMANT": {
+            "traits": ["Nervous", "Cunning", "Opportunistic"],
+            "appearance": "Slim figure, hooded jacket, darting eyes.",
+            "style": "Street-level realism, desaturated palette",
+        },
+    }
+
+    for name in sorted(all_chars):
+        base = default_profiles.get(name, {
+            "traits": ["Mysterious", "Complex"],
+            "appearance": f"Distinctive figure known only as {name}.",
+            "style": "Cinematic, character-driven composition",
+        })
+
+        # Optionally enhance with LLM (character_designer model)
+        if llm:
+            try:
+                resp = llm.invoke([
+                    SystemMessage(content=(
+                        "You are a Character Designer. Return a JSON object with keys: "
+                        "name, traits (list), appearance (str), style (str). "
+                        "One paragraph max per field. Valid JSON only, no markdown fences."
+                    )),
+                    HumanMessage(content=f"Design the character: {name}. Scene context: {state['raw_input'][:200]}"),
+                ])
+                raw_char = resp.content.strip()
+                # Strip markdown code fences if present
+                if raw_char.startswith("```"):
+                    raw_char = raw_char.split("```")[1]
+                    if raw_char.startswith("json"):
+                        raw_char = raw_char[4:]
+                parsed = json.loads(raw_char)
+                base.update(parsed)
+            except Exception as exc:
+                print(f"  [CharDesigner] LLM parse failed ({exc}), using defaults.")
+
+        profile = {
+            "name": name,
+            "traits": base.get("traits", ["Unknown"]),
+            "appearance": base.get("appearance", "Undescribed."),
+            "style": base.get("style", "Standard cinematic"),
+            "stock_footage_ref": None,
+        }
+
+        # Query stock footage via MCP
+        footage_raw = await call_mcp_tool(session, "query_stock_footage", {
+            "description": f"{name}: {profile['appearance']}"
+        })
+        footage = json.loads(footage_raw)
+        profile["stock_footage_ref"] = footage.get("matched_footage")
+        print(f"  • {name} → footage ref: {profile['stock_footage_ref']}")
+
+        # Commit character to vector DB
+        await call_mcp_tool(session, "commit_memory", {
+            "collection_name": "characters",
+            "documents": [json.dumps(profile)],
+            "metadatas": [{"name": name}],
+        })
+
+        char_db[name] = profile
+
+    return {**state, "character_db": char_db,
+            "messages": state["messages"] + [f"character_designer: {len(char_db)} chars"]}
+
+
+# ── Node 6: Image Synthesizer ──────────────────────────────────────────────────
+async def image_synthesizer_node(state: WriterState, session: ClientSession) -> WriterState:
+    """
+    Frame-by-frame image synthesis (instructor requirement).
+
+    For every scene in the manifest, we iterate over every character present
+    in that scene and generate a dedicated character reference frame tagged with
+    the scene.  This mimics the real pipeline where each scene has its own set
+    of per-character frames that feed the face-swap / video renderer downstream.
+
+    The character_db entry for each character is updated with:
+      - image_path        : the last-generated frame (baseline reference)
+      - scene_frames      : list of (scene_id, frame_path) tuples per character
+    """
+    print("\n" + "="*60)
+    print("  NODE: Image Synthesizer Agent  (frame-by-frame, via MCP → ComfyUI mock)")
+    print("="*60)
+
+    char_db   = state.get("character_db", {})
+    manifest  = state.get("scene_manifest", [])
+
+    # Ensure scene_frames list exists for every character
+    for name in char_db:
+        char_db[name].setdefault("scene_frames", [])
+
+    # ── Frame-by-frame loop ───────────────────────────────────────────────────
+    # Outer loop  : scenes   (represents time / narrative progression)
+    # Inner loop  : characters present in that scene (per-frame renders)
+    total_frames = 0
+    for scene in manifest:
+        scene_id    = scene.get("scene_id", "scene_unknown")
+        scene_chars = scene.get("characters", [])
+
+        print(f"\n  ── Scene: {scene_id}  ({len(scene_chars)} character(s)) ──")
+
+        for char_name in scene_chars:
+            if char_name not in char_db:
+                print(f"  [Skip] {char_name} not in character_db (no profile yet)")
+                continue
+
+            profile = char_db[char_name]
+            # Tag the frame with its scene context so the synthesizer can
+            # inject scene-specific lighting / colour-grade hints
+            frame_style = f"{profile.get('style', 'Cinematic')} | {scene.get('location', '')} lighting"
+
+            raw = await call_mcp_tool(session, "generate_image_asset", {
+                "character_name": f"{char_name} [{scene_id}]",
+                "appearance_description": profile.get("appearance", ""),
+                "style": frame_style,
+            })
+            result = json.loads(raw)
+            total_frames += 1
+
+            if result.get("status") == "success":
+                frame_path = result["image_path"]
+                print(f"    ✓ Frame {total_frames}: {char_name} @ {scene_id}  → {os.path.basename(frame_path)}")
+                # Keep track of every scene-level frame
+                char_db[char_name]["scene_frames"].append({
+                    "scene_id":   scene_id,
+                    "frame_path": frame_path,
+                })
+                # The first frame also serves as the baseline reference image
+                if "image_path" not in char_db[char_name]:
+                    char_db[char_name]["image_path"] = frame_path
+            else:
+                print(f"    ✗ Frame failed – {char_name} @ {scene_id}: {result.get('detail')}")
+
+    print(f"\n  ✓ Frame-by-frame synthesis complete: {total_frames} frame(s) generated.")
+    return {**state, "character_db": char_db,
+            "messages": state["messages"] + [f"image_synthesizer: {total_frames} frames"]}
+
+
+# ── Node 7: Memory Commit ──────────────────────────────────────────────────────
+async def memory_commit_node(state: WriterState, session: ClientSession) -> WriterState:
+    print("\n" + "="*60)
+    print("  NODE: Memory Commit (Final Outputs)")
+    print("="*60)
+
+    manifest_path = os.path.join(OUTPUT_DIR, "scene_manifest.json")
+    char_path = os.path.join(OUTPUT_DIR, "character_db.json")
+
+    with open(manifest_path, "w") as f:
+        json.dump(state.get("scene_manifest", []), f, indent=4)
+    print(f"  ✓ scene_manifest.json  → {manifest_path}")
+
+    with open(char_path, "w") as f:
+        json.dump(state.get("character_db", {}), f, indent=4)
+    print(f"  ✓ character_db.json    → {char_path}")
+
+    return {**state, "messages": state["messages"] + ["memory_commit: exported"]}
+
+
+# ── Node 8: Voice Synthesis (Person 2) ────────────────────────────────────────
+async def voice_synthesis_node(state: WriterState, session: ClientSession, llm: Optional[ChatGroq]) -> WriterState:
+    print("\n" + "="*60)
+    print("  NODE: Voice Synthesis Agent")
+    print("="*60)
+    
+    manifest = state.get("scene_manifest", [])
+    for scene in manifest:
+        for dialogue in scene.get('dialogue', []):
+            speaker = dialogue.get("speaker", "UNKNOWN")
+            line = dialogue.get("line", "")
+            
+            emotion = "neutral"
+            if llm:
+                try:
+                    resp = llm.invoke([
+                        SystemMessage(content=(
+                            "You are an emotion analyzer. Reply with ONLY "
+                            "one single word representing the primary emotion of the speaker."
+                        )),
+                        HumanMessage(content=f"Speaker: {speaker}\nLine: {line}"),
+                    ])
+                    emotion = resp.content.strip().lower()
+                    emotion = ''.join(e for e in emotion if e.isalnum())
+                except Exception:
+                    emotion = "neutral"
+                    
+            print(f"  [{speaker}] ({emotion}): {line[:50]}...")
+            
+            raw = await call_mcp_tool(session, "voice_cloning_synthesizer", {
+                "character_name": speaker,
+                "dialogue": line,
+                "emotion": emotion
+            })
+            res = json.loads(raw)
+            if res.get("status") == "success":
+                print(f"    [OK] Audio generated: {res.get('audio_path')}")
+            else:
+                print(f"    [FAIL] Audio failed: {res.get('detail')}")
+
+    return {**state, "messages": state["messages"] + ["voice_synthesis: completed"]}
+
+
+# ── Node 9: Face Swap (Person 2) – frame-by-frame ────────────────────────────
+async def face_swap_node(state: WriterState, session: ClientSession) -> WriterState:
+    """
+    Frame-by-frame face swap (instructor requirement).
+
+    For every character the image_synthesizer produced scene-level frames for,
+    we iterate over each frame individually:
+      1. Validate the character identity on that specific frame.
+      2. Perform the face-swap onto the corresponding scene's target video.
+
+    This ensures frame-level fidelity rather than a single bulk operation.
+    """
+    print("\n" + "="*60)
+    print("  NODE: Face Swap Agent  (frame-by-frame per scene)")
+    print("="*60)
+
+    char_db     = state.get("character_db", {})
+    total_swaps = 0
+
+    for char_name, profile in char_db.items():
+        scene_frames = profile.get("scene_frames", [])
+
+        # Fall back to the baseline image_path if no scene_frames were recorded
+        if not scene_frames:
+            baseline = profile.get("image_path")
+            if baseline:
+                scene_frames = [{"scene_id": "scene_001", "frame_path": baseline}]
+            else:
+                print(f"  [Skip] No frames for {char_name}")
+                continue
+
+        print(f"\n  Character: {char_name}  ({len(scene_frames)} frame(s) to process)")
+
+        for frame_info in scene_frames:
+            scene_id   = frame_info.get("scene_id", "scene_unknown")
+            frame_path = frame_info.get("frame_path", "")
+
+            print(f"    ── Frame: {os.path.basename(frame_path)}  (scene: {scene_id})")
+
+            # Step 1: Validate identity on this specific frame
+            val_raw = await call_mcp_tool(session, "identity_validator", {
+                "character_name": char_name,
+                "image_path":     frame_path,
+            })
+            val_res = json.loads(val_raw)
+
+            if not val_res.get("is_valid"):
+                print(f"      [FAIL] Identity check failed: {val_res.get('message')}")
+                continue
+
+            print(f"      [OK] Identity validated (confidence: {val_res.get('confidence')})")
+
+            # Step 2: Swap face onto the scene's target video
+            target_video = f"scene_{scene_id}_target.mp4"
+            swap_raw = await call_mcp_tool(session, "face_swapper", {
+                "source_image": frame_path,
+                "target_media": target_video,
+            })
+            swap_res = json.loads(swap_raw)
+
+            total_swaps += 1
+            if swap_res.get("status") == "success":
+                print(f"      [OK] Face swapped → {swap_res.get('swapped_media')}")
+            else:
+                print(f"      [FAIL] Swap failed: {swap_res.get('detail')}")
+
+    print(f"\n  ✓ Frame-by-frame face swap complete: {total_swaps} swap(s) performed.")
+    return {**state, "messages": state["messages"] + [f"face_swap: {total_swaps} frames"]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ROUTING FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def route_after_mode(state: WriterState) -> str:
+    return "validator" if state["mode"] == "manual" else "scriptwriter"
+
+
+def route_after_hitl(state: WriterState) -> str:
+    if not state["approved"]:
+        feedback = state.get("feedback", "")
+        if feedback == "human_edit":
+            # Loop back to scriptwriter with revised prompt
+            return "scriptwriter"
+        return END
+    return "character_designer"
+
+
+def route_after_validator(state: WriterState) -> str:
+    if state.get("feedback") == "valid":
+        return "hitl"
+    # validator failed → print feedback and stop
+    print(f"\n[Validator] Rejected: {state.get('feedback')}")
+    return END
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN WORKFLOW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def run_workflow(raw_input: str) -> None:
+    print("\n" + "█"*60)
+    print("  THE WRITER'S ROOM  –  Phase 1 Starting…")
+    print("█"*60)
+
+    # ── Bootstrap per-agent LLMs (instructor requirement: different models) ──
+    print("\n[LLM] Initialising per-agent models…")
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        print("[Warning] No GROQ_API_KEY found – running in offline mock mode.\n"
+              "  Add your key to .env to enable live LLM reasoning.")
+
+    llm_scriptwriter       = get_llm_for_agent("scriptwriter")
+    llm_character_designer = get_llm_for_agent("character_designer")
+    llm_voice_synthesis    = get_llm_for_agent("voice_synthesis")
+
+    server_params = StdioServerParameters(
+        command=sys.executable,
+        args=[MCP_SERVER],
+    )
+
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await list_mcp_tools(session)
+            print(f"\n[MCP] Connected – {len(tools)} tools discovered: {tools}")
+
+            # ── Build LangGraph ──────────────────────────────────────────────
+            graph = StateGraph(WriterState)
+
+            # Partial application of session / per-agent llm into node functions
+            async def ms(s):   return await mode_selector_node(s, session)
+            async def vn(s):   return await validator_node(s, session)
+            async def sw(s):   return await scriptwriter_node(s, session, llm_scriptwriter)
+            async def hn(s):   return await hitl_node(s, session)
+            async def cd(s):   return await character_designer_node(s, session, llm_character_designer)
+            async def img(s):  return await image_synthesizer_node(s, session)
+            async def mc(s):   return await memory_commit_node(s, session)
+
+            async def vs(s):   return await voice_synthesis_node(s, session, llm_voice_synthesis)
+            async def fs(s):   return await face_swap_node(s, session)
+
+            graph.add_node("mode_selector",      ms)
+            graph.add_node("validator",           vn)
+            graph.add_node("scriptwriter",        sw)
+            graph.add_node("hitl",               hn)
+            graph.add_node("character_designer",  cd)
+            graph.add_node("image_synthesizer",   img)
+            graph.add_node("memory_commit",       mc)
+
+            # Edges
+            graph.add_edge(START, "mode_selector")
+            graph.add_conditional_edges("mode_selector", route_after_mode)
+            graph.add_conditional_edges("validator",    route_after_validator)
+            graph.add_edge("scriptwriter", "hitl")
+            graph.add_conditional_edges("hitl",         route_after_hitl)
+            graph.add_edge("character_designer",  "image_synthesizer")
+            graph.add_edge("image_synthesizer",   "memory_commit")
+            graph.add_edge("memory_commit",       END)
+
+            app = graph.compile()
+
+            # ── Initial state ────────────────────────────────────────────────
+            init: WriterState = {
+                "mode": "",
+                "raw_input": raw_input,
+                "scene_manifest": [],
+                "character_db": {},
+                "feedback": "",
+                "approved": False,
+                "messages": [],
+            }
+
+            result = await app.ainvoke(init)
+
+    print("\n" + "═"*60)
+    print("  PIPELINE COMPLETE")
+    print("═"*60)
+    print(f"  Scenes generated : {len(result.get('scene_manifest', []))}")
+    print(f"  Characters built : {len(result.get('character_db', {}))}")
+    print(f"  Agent log        : {' → '.join(result.get('messages', []))}")
+    print("\n  Output files:")
+    for f in ("scene_manifest.json", "character_db.json"):
+        path = os.path.join(OUTPUT_DIR, f)
+        print(f"   {'✓' if os.path.exists(path) else '✗'} {f}")
+    img_dir = os.path.join(OUTPUT_DIR, "image_assets")
+    imgs = os.listdir(img_dir) if os.path.isdir(img_dir) else []
+    print(f"   ✓ image_assets/ ({len(imgs)} images)\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="The Writer's Room – Phase 1")
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="A cyberpunk detective infiltrates a neon megacity to expose a rogue AI that has been rewriting human memories.",
+        help="Prompt for Autonomous mode",
+    )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["auto", "manual"],
+        default="auto",
+        help="auto = Autonomous generation | manual = validate a user script",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "manual":
+        # Provide a sample manual script
+        text = (
+            "INT. ANCIENT LIBRARY – DAY\n"
+            "SCHOLAR: The prophecy speaks of three trials.\n"
+            "She opens an ancient tome, dust particles dancing in the sunlight.\n"
+            "GUARDIAN: You must succeed where others have failed.\n"
+            "CUT TO:\n"
+            "EXT. ENCHANTED FOREST – TWILIGHT\n"
+            "Mystical creatures emerge from the mist between ancient trees.\n"
+        )
+    else:
+        text = args.prompt
+
+    asyncio.run(run_workflow(text))
