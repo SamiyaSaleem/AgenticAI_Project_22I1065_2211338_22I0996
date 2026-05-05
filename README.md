@@ -263,5 +263,3 @@ All members: shared JSON schema design, integration testing, project report, pre
 - The LangGraph face-swap and lip-sync agents are simulated via the MCP server (real InsightFace/Wav2Lip would require CUDA GPU).
 
 ---
-
-*Built for the Agentic AI Course — FAST-NUCES Islamabad, 2026*
