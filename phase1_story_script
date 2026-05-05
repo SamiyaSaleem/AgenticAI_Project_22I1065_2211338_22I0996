@@ -1,27 +1,4 @@
-
-"""
-THE WRITER'S ROOM – Phase 1
-============================
-LangGraph multi-agent pipeline implementing the Supervisor-Worker model.
-
-Nodes (agents):
-  mode_selector     → decides Manual vs Autonomous mode
-  validator         → (Manual) checks scene headings / dialogue / actions
-  scriptwriter      → (Autonomous) expands prompt → scene_manifest via MCP
-  hitl              → Human-In-The-Loop checkpoint
-  character_designer→ extracts character identities, queries stock footage
-  image_synthesizer → generates per-scene character frames (frame-by-frame)
-  memory_commit     → flushes scene_manifest.json + character_db.json
-  voice_synthesis   → emotion-aware TTS per dialogue line
-  face_swap         → identity validation + face mapping per frame
-
-All tool calls go through the MCP stdio client (dynamic discovery, no hardcoding).
-
-Key design choices:
-  - DIFFERENT LLM models are assigned per agent (instructor requirement).
-  - Image synthesis works FRAME-BY-FRAME across every scene (instructor requirement).
-"""
-
+//main.py
 import os
 import sys
 import json
