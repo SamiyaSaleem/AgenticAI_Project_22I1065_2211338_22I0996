@@ -1,0 +1,397 @@
+import os
+import sys
+import json
+import uuid
+import wave
+import asyncio
+import textwrap
+from typing import List, Dict, Any, Optional, Tuple
+
+import numpy as np
+from PIL import Image, ImageDraw
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── Directories ───────────────────────────────────────────────────────────────
+OUTPUT_DIR    = os.path.dirname(os.path.abspath(__file__))
+IMAGE_DIR     = os.path.join(OUTPUT_DIR, "image_assets")
+AUDIO_DIR     = os.path.join(OUTPUT_DIR, "audio_assets")
+RAW_SCENES_DIR= os.path.join(OUTPUT_DIR, "raw_scenes")
+os.makedirs(AUDIO_DIR, exist_ok=True)
+os.makedirs(RAW_SCENES_DIR, exist_ok=True)
+
+# ── Video settings ────────────────────────────────────────────────────────────
+VID_W, VID_H = 854, 480
+FPS          = 24
+ZOOM_FACTOR  = 0.12          # 12 % Ken-Burns zoom over the clip
+CROSSFADE_S  = 0.4           # crossfade between scenes (seconds)
+
+# ── Voice profiles (character → edge-tts voice) ───────────────────────────────
+VOICE_MAP: Dict[str, str] = {
+    "JEN":            "en-US-JennyNeural",
+    "MIKE":           "en-US-GuyNeural",
+    "PRINCIPAL SMITH":"en-US-ChristopherNeural",
+    "KAI":            "en-US-GuyNeural",
+    "LENA":           "en-US-JennyNeural",
+    "ADA":            "en-US-AriaNeural",
+    "ZARA":           "en-US-MichelleNeural",
+    "DETECTIVE":      "en-US-ChristopherNeural",
+    "ROGUE AI":       "en-US-AndrewNeural",
+    "INFORMANT":      "en-US-EricNeural",
+    "DEFAULT":        "en-US-AriaNeural",
+}
+
+# ── Location → background colour ─────────────────────────────────────────────
+_LOC_BG: Dict[str, Tuple] = {
+    "night":   (8,  12, 35),
+    "dark":    (15, 10, 30),
+    "ext":     (10, 30, 55),
+    "int":     (30, 20, 50),
+    "day":     (20, 45, 70),
+    "stadium": (5,  25, 10),
+    "court":   (10, 30, 15),
+    "forest":  (10, 35, 10),
+    "space":   (5,   5, 30),
+    "office":  (25, 20, 40),
+    "city":    (20, 20, 45),
+    "hallway": (28, 22, 45),
+    "school":  (25, 30, 50),
+    "bar":     (30, 10, 20),
+}
+
+def _location_bg(location: str) -> Tuple[int, int, int]:
+    loc = location.lower()
+    for kw, color in _LOC_BG.items():
+        if kw in loc:
+            return color
+    return (18, 18, 40)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _find_char_image(name: str, scene_id: str) -> Optional[str]:
+    """Look for scene-specific portrait, then any portrait for the character."""
+    safe = name.lower().replace(" ", "_")
+    for fname in [f"{safe}__{scene_id}_.jpg", f"{safe}__scene_{scene_id.split('_')[-1]}_.jpg"]:
+        p = os.path.join(IMAGE_DIR, fname)
+        if os.path.exists(p):
+            return p
+    if os.path.isdir(IMAGE_DIR):
+        for fname in sorted(os.listdir(IMAGE_DIR)):
+            if fname.startswith(safe) and fname.endswith(".jpg"):
+                return os.path.join(IMAGE_DIR, fname)
+    return None
+
+
+def _wav_duration(path: str) -> float:
+    """Return duration of a WAV file in seconds."""
+    try:
+        with wave.open(path, "rb") as wf:
+            return wf.getnframes() / float(wf.getframerate())
+    except Exception:
+        return 2.0
+
+
+def _compose_scene_frame(scene: Dict, width: int, height: int,
+                          subtitle: str = "") -> np.ndarray:
+    """
+    Render a full scene frame:
+      - Gradient background tinted by location
+      - Character portraits side-by-side
+      - Top banner: location + scene ID
+      - Bottom subtitle bar
+    """
+    bg = _location_bg(scene.get("location", ""))
+    img = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(img)
+
+    # Vignette-style gradient (top)
+    for i in range(height // 3):
+        alpha = int(60 * (1 - i / (height / 3)))
+        row_c = tuple(max(0, c - alpha // 4) for c in bg)
+        draw.rectangle([0, i, width, i + 1], fill=row_c)
+
+    # ── Top banner ────────────────────────────────────────────────────────────
+    draw.rectangle([0, 0, width, 52], fill=(8, 8, 22))
+    draw.text((12, 5),  "THE WRITER'S ROOM",              fill=(255, 215, 0))
+    draw.text((12, 27), scene.get("location", "")[:65],   fill=(140, 210, 140))
+    sid = scene.get("scene_id", "").upper()
+    draw.text((width - len(sid) * 8 - 12, 5), sid,        fill=(180, 180, 255))
+    draw.text((width - 160, 27), "Phase 3 · AI Composed",  fill=(120, 120, 160))
+
+    # ── Character portraits ───────────────────────────────────────────────────
+    chars     = scene.get("characters", [])
+    scene_id  = scene.get("scene_id", "")
+    n         = max(len(chars), 1)
+    port_h    = height - 52 - 70
+    port_w    = min(260, (width - 20) // n - 10)
+
+    for idx, char in enumerate(chars[:3]):
+        x = 10 + idx * (port_w + 10)
+        img_path = _find_char_image(char, scene_id)
+
+        if img_path:
+            try:
+                c_img = Image.open(img_path).convert("RGB").resize(
+                    (port_w, port_h), Image.LANCZOS)
+                img.paste(c_img, (x, 52))
+            except Exception:
+                draw.rectangle([x, 52, x + port_w, 52 + port_h],
+                               fill=((50 + idx * 60) % 200, 40, 80))
+        else:
+            draw.rectangle([x, 52, x + port_w, 52 + port_h],
+                           fill=((50 + idx * 60) % 200, 40, 80))
+            draw.text((x + 6, 52 + port_h // 2), char[:16], fill=(255, 255, 255))
+
+        # Name tag
+        ty = 52 + port_h
+        draw.rectangle([x, ty, x + port_w, ty + 22], fill=(10, 10, 28))
+        draw.text((x + 4, ty + 3), char[:20], fill=(220, 220, 80))
+
+    # ── Subtitle bar ─────────────────────────────────────────────────────────
+    sy = height - 66
+    draw.rectangle([0, sy, width, height], fill=(0, 0, 0))
+    if subtitle:
+        for si, sl in enumerate(textwrap.wrap(subtitle, 90)[:3]):
+            draw.text((10, sy + 5 + si * 20), sl, fill=(255, 255, 255))
+
+    return np.array(img)
+
+
+def _ken_burns_clip(scene: Dict, dialogue_segments: List[Dict],
+                    total_duration: float):
+    """
+    Build a moviepy VideoClip with Ken Burns zoom for one scene.
+    Subtitles update based on dialogue_segments timing.
+    """
+    from moviepy import VideoClip
+
+    # Pre-render the base frame at 15% larger for zoom headroom
+    BW = int(VID_W * (1 + ZOOM_FACTOR))
+    BH = int(VID_H * (1 + ZOOM_FACTOR))
+    base_frame = _compose_scene_frame(scene, BW, BH, subtitle="")
+
+    def make_frame(t: float) -> np.ndarray:
+        progress = t / max(total_duration - 0.001, 0.001)
+        zoom     = 1.0 + ZOOM_FACTOR * progress    # 1.0 → 1+ZOOM_FACTOR
+
+        # Crop window shrinks as zoom increases (simulates zoom-in)
+        crop_w = int(VID_W / zoom * (1 + ZOOM_FACTOR))
+        crop_h = int(VID_H / zoom * (1 + ZOOM_FACTOR))
+        crop_w = min(crop_w, BW)
+        crop_h = min(crop_h, BH)
+
+        # Drift the crop window slightly left-to-right (pan)
+        x_off = int((BW - crop_w) * 0.5 * progress)
+        y_off = int((BH - crop_h) * 0.3 * progress)
+        x_off = max(0, min(x_off, BW - crop_w))
+        y_off = max(0, min(y_off, BH - crop_h))
+
+        # Crop, then resize to output resolution
+        cropped = base_frame[y_off:y_off + crop_h, x_off:x_off + crop_w]
+        pil_crop = Image.fromarray(cropped).resize((VID_W, VID_H), Image.LANCZOS)
+
+        # Determine current subtitle
+        subtitle = ""
+        for seg in dialogue_segments:
+            if seg["start_s"] <= t < seg["end_s"]:
+                subtitle = f"{seg['speaker']}: {seg['line']}"
+                break
+
+        if subtitle:
+            draw_img = ImageDraw.Draw(pil_crop)
+            sy = VID_H - 66
+            draw_img.rectangle([0, sy, VID_W, VID_H], fill=(0, 0, 0))
+            for si, sl in enumerate(textwrap.wrap(subtitle, 90)[:3]):
+                draw_img.text((10, sy + 5 + si * 20), sl, fill=(255, 255, 255))
+
+        return np.array(pil_crop)
+
+    clip = VideoClip(make_frame, duration=total_duration).with_fps(FPS)
+    return clip
+
+
+# ── Audio synthesis ───────────────────────────────────────────────────────────
+async def _synthesise_line(speaker: str, line: str,
+                           emotion: str = "neutral") -> str:
+    """Synthesise one dialogue line with edge-tts, return WAV path."""
+    import edge_tts
+    voice     = VOICE_MAP.get(speaker.upper(), VOICE_MAP["DEFAULT"])
+    safe      = "".join(c if c.isalnum() else "_" for c in speaker.lower())
+    filename  = f"p3_{safe}_{uuid.uuid4().hex[:6]}.wav"
+    filepath  = os.path.join(AUDIO_DIR, filename)
+
+    # Emotion-based rate/pitch
+    rate, pitch = "+0%", "+0Hz"
+    emo = emotion.lower()
+    if emo in ("angry", "urgent", "frustrated"):
+        rate, pitch = "+15%", "+10Hz"
+    elif emo in ("sad", "nervous", "remorse"):
+        rate, pitch = "-10%", "-10Hz"
+
+    communicate = edge_tts.Communicate(line, voice, rate=rate, pitch=pitch)
+    await communicate.save(filepath)
+    return filepath
+
+
+async def _build_scene_audio(scene: Dict) -> Tuple[List[Dict], Optional[str]]:
+    """
+    Synthesise all dialogue lines for a scene.
+    Returns (dialogue_segments, concatenated_wav_path).
+    """
+    from moviepy import concatenate_audioclips, AudioFileClip
+
+    dialogues = scene.get("dialogue", [])
+    segments  = []
+    clips     = []
+    cursor    = 0.0
+
+    for dlg in dialogues:
+        speaker = dlg.get("speaker", "UNKNOWN")
+        line    = dlg.get("line", "")
+        if not line:
+            continue
+        try:
+            wav = await _synthesise_line(speaker, line)
+            dur = _wav_duration(wav)
+            segments.append({
+                "speaker": speaker,
+                "line":    line,
+                "audio_file": wav,
+                "start_s":    cursor,
+                "end_s":      cursor + dur,
+                "start_ms":   int(cursor * 1000),
+                "end_ms":     int((cursor + dur) * 1000),
+            })
+            cursor += dur
+            clips.append(AudioFileClip(wav))
+        except Exception as exc:
+            print(f"  [TTS] {speaker} failed: {exc}")
+
+    if not clips:
+        return segments, None
+
+    # Concatenate all line audio into one scene audio track
+    combined_name = f"scene_{scene['scene_id']}_combined.wav"
+    combined_path = os.path.join(AUDIO_DIR, combined_name)
+    try:
+        combined = concatenate_audioclips(clips)
+        combined.write_audiofile(combined_path, logger=None)
+    except Exception as exc:
+        print(f"  [Audio concat] {exc}")
+        combined_path = clips[0].filename if clips else None
+
+    return segments, combined_path
+
+
+# ── Per-scene video builder ───────────────────────────────────────────────────
+async def build_scene_clip(scene: Dict):
+    """Build the full video clip for one scene (Ken Burns + audio + subtitles)."""
+    print(f"\n  [Scene] {scene['scene_id']} | {scene.get('location','')}")
+
+    # Synthesise audio
+    segments, audio_path = await _build_scene_audio(scene)
+    total_dur = max(segments[-1]["end_s"] if segments else 0.0, 3.0) + 0.5
+
+    # Build Ken Burns clip
+    clip = _ken_burns_clip(scene, segments, total_dur)
+
+    # Attach audio
+    if audio_path and os.path.exists(audio_path):
+        try:
+            from moviepy import AudioFileClip
+            audio = AudioFileClip(audio_path).subclipped(0, total_dur)
+            clip  = clip.with_audio(audio)
+            print(f"    [OK] Audio attached ({total_dur:.1f}s)")
+        except Exception as exc:
+            print(f"    [WARN] Audio attach: {exc}")
+    else:
+        print("    [WARN] No audio available for this scene")
+
+    return clip, segments
+
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+async def main():
+    try:
+        from moviepy import concatenate_videoclips
+    except ImportError:
+        print("[ERROR] moviepy not installed. Run: pip install moviepy")
+        return
+
+    print("=" * 60)
+    print("  THE WRITER'S ROOM - Phase 3: Video Generation")
+    print("=" * 60)
+
+    # Load scene manifest
+    manifest_path = os.path.join(OUTPUT_DIR, "scene_manifest.json")
+    if not os.path.exists(manifest_path):
+        print("[ERROR] scene_manifest.json not found. Run Phase 1 first.")
+        return
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        scenes = json.load(f)
+
+    print(f"\n  Loaded {len(scenes)} scenes from scene_manifest.json")
+
+    # Build per-scene clips in sequence (TTS is async, video is CPU-bound)
+    all_clips    = []
+    timing_entries = []
+
+    for scene in scenes:
+        clip, segments = await build_scene_clip(scene)
+        all_clips.append(clip)
+        for seg in segments:
+            timing_entries.append({
+                "scene_id":   scene["scene_id"],
+                "location":   scene.get("location", ""),
+                "speaker":    seg["speaker"],
+                "line":       seg["line"],
+                "audio_file": seg["audio_file"],
+                "start_ms":   seg["start_ms"],
+                "end_ms":     seg["end_ms"],
+            })
+
+    # Write timing_manifest.json
+    tm_path = os.path.join(OUTPUT_DIR, "timing_manifest.json")
+    with open(tm_path, "w", encoding="utf-8") as f:
+        json.dump(timing_entries, f, indent=2)
+    print(f"\n  [OK] timing_manifest.json -> {tm_path}")
+
+    # Concatenate all scene clips
+    print("\n  [Compose] Concatenating scenes with crossfade transitions...")
+    try:
+        if len(all_clips) == 1:
+            final = all_clips[0]
+        else:
+            final = concatenate_videoclips(all_clips, method="compose")
+    except Exception as exc:
+        print(f"  [WARN] Crossfade failed ({exc}), using simple concat...")
+        final = concatenate_videoclips(all_clips)
+
+    # Write final_output.mp4
+    out_path = os.path.join(OUTPUT_DIR, "final_output.mp4")
+    print(f"\n  [Render] Writing final_output.mp4 ({final.duration:.1f}s)...")
+    final.write_videofile(
+        out_path,
+        codec="libx264",
+        audio_codec="aac",
+        fps=FPS,
+        logger=None,
+        temp_audiofile=out_path + ".tmp.m4a",
+    )
+
+    size_mb = os.path.getsize(out_path) / (1024 * 1024)
+    print("\n" + "=" * 60)
+    print("  PHASE 3 COMPLETE")
+    print("=" * 60)
+    print(f"  [OK] final_output.mp4  ({size_mb:.1f} MB)  -> {out_path}")
+    print(f"  [OK] timing_manifest.json               -> {tm_path}")
+    print(f"  [OK] Total duration : {final.duration:.1f} s")
+    print(f"  [OK] Scenes         : {len(scenes)}")
+    print(f"  [OK] Dialogue lines : {len(timing_entries)}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
