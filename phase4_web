@@ -1,0 +1,364 @@
+import os
+import sys
+import json
+import uuid
+import asyncio
+import subprocess
+from typing import Optional, List, Dict, Any
+from pathlib import Path
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.responses import (
+    FileResponse, HTMLResponse, StreamingResponse, JSONResponse
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+# ── Import pipeline phases ────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, BASE_DIR)
+
+# ── App setup ─────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="AI Animated Video Generator",
+    description="End-to-end agentic pipeline: prompt → animated short film",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Serve static files (the web UI)
+_static_dir = os.path.join(BASE_DIR, "static")
+if os.path.isdir(_static_dir):
+    app.mount("/static", StaticFiles(directory=_static_dir), name="static")
+
+# ── Global pipeline state ─────────────────────────────────────────────────────
+pipeline_status: Dict[str, Any] = {
+    "running": False,
+    "current_phase": None,
+    "phases": {
+        "phase1": {"status": "idle", "message": ""},
+        "phase2": {"status": "idle", "message": ""},
+        "phase3": {"status": "idle", "message": ""},
+    },
+    "prompt": "",
+    "error": None,
+    "finished": False,
+}
+
+# SSE subscriber queues
+sse_queues: List[asyncio.Queue] = []
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
+class PromptRequest(BaseModel):
+    prompt: str
+    mode: Optional[str] = "auto"
+
+class EditRequest(BaseModel):
+    query: str
+
+class UndoRequest(BaseModel):
+    version: Optional[int] = None  # None = undo last
+
+# ── SSE helpers ───────────────────────────────────────────────────────────────
+async def broadcast(event: str, data: dict):
+    """Push an SSE event to all connected clients."""
+    msg = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    dead = []
+    for q in sse_queues:
+        try:
+            q.put_nowait(msg)
+        except asyncio.QueueFull:
+            dead.append(q)
+    for q in dead:
+        sse_queues.remove(q)
+
+
+def update_phase(phase: str, status: str, message: str):
+    """Update global pipeline status and broadcast to SSE clients."""
+    pipeline_status["phases"][phase] = {"status": status, "message": message}
+    pipeline_status["current_phase"] = phase
+    asyncio.get_event_loop().create_task(
+        broadcast("phase_update", {
+            "phase": phase,
+            "status": status,
+            "message": message,
+            "timestamp": datetime.now().isoformat(),
+        })
+    )
+
+
+# ── Pipeline runner ───────────────────────────────────────────────────────────
+async def run_pipeline(prompt: str, mode: str = "auto"):
+    """Execute all pipeline phases sequentially with SSE progress updates."""
+    global pipeline_status
+    pipeline_status["running"] = True
+    pipeline_status["finished"] = False
+    pipeline_status["error"] = None
+    pipeline_status["prompt"] = prompt
+
+    await broadcast("pipeline_start", {"prompt": prompt, "mode": mode})
+
+    try:
+        # ── Phase 1: Story & Script ───────────────────────────────────────────
+        update_phase("phase1", "running", "Generating story, script, and characters...")
+        try:
+            from main import run_workflow
+            await run_workflow(prompt)
+            update_phase("phase1", "done", "Story, script, and character DB generated ✓")
+            await broadcast("phase_done", {"phase": "phase1", "output": "scene_manifest.json"})
+        except Exception as e:
+            update_phase("phase1", "error", f"Phase 1 error: {str(e)}")
+            await broadcast("error", {"phase": "phase1", "message": str(e)})
+            pipeline_status["error"] = str(e)
+            return
+
+        # ── Phase 2: Audio Generation ─────────────────────────────────────────
+        update_phase("phase2", "running", "Synthesising character voices and audio...")
+        try:
+            from phase2_pipeline import run_phase2
+            await run_phase2()
+            update_phase("phase2", "done", "Audio files and timing manifest generated ✓")
+            await broadcast("phase_done", {"phase": "phase2", "output": "timing_manifest.json"})
+        except Exception as e:
+            update_phase("phase2", "error", f"Phase 2 error: {str(e)}")
+            await broadcast("error", {"phase": "phase2", "message": str(e)})
+            pipeline_status["error"] = str(e)
+            return
+
+        # ── Phase 3: Video Composition ────────────────────────────────────────
+        update_phase("phase3", "running", "Composing animated video with Ken Burns effects...")
+        try:
+            from phase3_pipeline import main as run_phase3
+            await run_phase3()
+            update_phase("phase3", "done", "final_output.mp4 rendered ✓")
+            await broadcast("phase_done", {"phase": "phase3", "output": "final_output.mp4"})
+        except Exception as e:
+            update_phase("phase3", "error", f"Phase 3 error: {str(e)}")
+            await broadcast("error", {"phase": "phase3", "message": str(e)})
+            pipeline_status["error"] = str(e)
+            return
+
+        # ── Take initial state snapshot for undo system ───────────────────────
+        from phase5_edit_agent import state_manager
+        state_manager.snapshot(
+            description=f"Initial generation: {prompt[:60]}",
+            assets={
+                "scene_manifest": os.path.join(BASE_DIR, "scene_manifest.json"),
+                "timing_manifest": os.path.join(BASE_DIR, "timing_manifest.json"),
+                "final_output": os.path.join(BASE_DIR, "final_output.mp4"),
+            }
+        )
+
+        pipeline_status["finished"] = True
+        await broadcast("pipeline_complete", {
+            "message": "Pipeline complete! Your animated video is ready.",
+            "video_url": "/video/final_output.mp4",
+        })
+
+    except Exception as e:
+        pipeline_status["error"] = str(e)
+        await broadcast("error", {"message": str(e)})
+    finally:
+        pipeline_status["running"] = False
+
+
+async def run_single_phase(phase: str, **kwargs):
+    """Re-run a single pipeline phase (for phase-level re-run buttons)."""
+    update_phase(phase, "running", f"Re-running {phase}...")
+    try:
+        if phase == "phase1":
+            from main import run_workflow
+            prompt = kwargs.get("prompt", pipeline_status.get("prompt", ""))
+            await run_workflow(prompt)
+        elif phase == "phase2":
+            from phase2_pipeline import run_phase2
+            await run_phase2()
+        elif phase == "phase3":
+            from phase3_pipeline import main as run_phase3
+            await run_phase3()
+        update_phase(phase, "done", f"{phase} re-run complete ✓")
+        await broadcast("phase_done", {"phase": phase, "rerun": True})
+    except Exception as e:
+        update_phase(phase, "error", str(e))
+        await broadcast("error", {"phase": phase, "message": str(e)})
+
+
+# ── API Endpoints ─────────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def serve_ui():
+    """Serve the main web UI."""
+    html_path = os.path.join(BASE_DIR, "static", "index.html")
+    if os.path.exists(html_path):
+        with open(html_path, "r") as f:
+            return HTMLResponse(content=f.read())
+    return HTMLResponse(content=get_inline_html())
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "version": "1.0.0"}
+
+
+@app.post("/generate")
+async def generate(req: PromptRequest, background_tasks: BackgroundTasks):
+    """Start the full pipeline from a user prompt."""
+    if pipeline_status["running"]:
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+    background_tasks.add_task(run_pipeline, req.prompt, req.mode)
+    return {"message": "Pipeline started", "prompt": req.prompt}
+
+
+@app.get("/status")
+async def get_status():
+    """Return current pipeline status."""
+    return pipeline_status
+
+
+@app.get("/progress")
+async def progress_stream():
+    """SSE endpoint for real-time pipeline progress."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+    sse_queues.append(queue)
+
+    async def event_generator():
+        # Send current status immediately on connect
+        yield f"event: status\ndata: {json.dumps(pipeline_status)}\n\n"
+        try:
+            while True:
+                try:
+                    msg = await asyncio.wait_for(queue.get(), timeout=30)
+                    yield msg
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if queue in sse_queues:
+                sse_queues.remove(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+@app.post("/rerun/{phase}")
+async def rerun_phase(phase: str, background_tasks: BackgroundTasks):
+    """Re-run a specific pipeline phase."""
+    if phase not in ("phase1", "phase2", "phase3"):
+        raise HTTPException(status_code=400, detail="Invalid phase")
+    if pipeline_status["running"]:
+        raise HTTPException(status_code=409, detail="Pipeline already running")
+    background_tasks.add_task(run_single_phase, phase)
+    return {"message": f"{phase} re-run started"}
+
+
+@app.get("/video/{filename}")
+async def get_video(filename: str):
+    """Stream the final video."""
+    path = os.path.join(BASE_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Video not found")
+    return FileResponse(path, media_type="video/mp4")
+
+
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    """Download a generated file."""
+    # Whitelist safe files
+    allowed = {"final_output.mp4", "scene_manifest.json", "timing_manifest.json", "character_db.json"}
+    if filename not in allowed:
+        raise HTTPException(status_code=403, detail="File not allowed")
+    path = os.path.join(BASE_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, filename=filename)
+
+
+@app.get("/assets")
+async def list_assets():
+    """Return a list of generated assets."""
+    assets = {}
+    for fname in ("scene_manifest.json", "timing_manifest.json", "character_db.json"):
+        path = os.path.join(BASE_DIR, fname)
+        assets[fname] = os.path.exists(path)
+    video_path = os.path.join(BASE_DIR, "final_output.mp4")
+    assets["final_output.mp4"] = os.path.exists(video_path)
+    if os.path.exists(video_path):
+        assets["video_size_mb"] = round(os.path.getsize(video_path) / (1024*1024), 2)
+
+    # Audio files
+    audio_dir = os.path.join(BASE_DIR, "audio_assets")
+    assets["audio_count"] = len(os.listdir(audio_dir)) if os.path.isdir(audio_dir) else 0
+
+    # Images
+    image_dir = os.path.join(BASE_DIR, "image_assets")
+    assets["image_count"] = len(os.listdir(image_dir)) if os.path.isdir(image_dir) else 0
+
+    return assets
+
+
+# ── Phase 5: Edit Agent endpoints ─────────────────────────────────────────────
+
+@app.post("/edit")
+async def edit(req: EditRequest, background_tasks: BackgroundTasks):
+    """
+    Accept a free-text edit command, classify the intent, execute the edit,
+    and save a state snapshot.
+    """
+    from phase5_edit_agent import edit_agent, state_manager
+    result = await edit_agent.process_edit(req.query)
+    return result
+
+
+@app.get("/history")
+async def get_history():
+    """Return the full version history."""
+    from phase5_edit_agent import state_manager
+    return {"history": state_manager.history()}
+
+
+@app.post("/undo")
+async def undo(req: UndoRequest):
+    """Undo to a specific version or the previous version."""
+    from phase5_edit_agent import state_manager
+    result = state_manager.revert(req.version)
+    await broadcast("undo", {"version": result.get("version"), "description": result.get("description")})
+    return result
+
+
+@app.get("/version/{version_id}")
+async def get_version(version_id: int):
+    """Get details of a specific version."""
+    from phase5_edit_agent import state_manager
+    history = state_manager.history()
+    matches = [v for v in history if v["version"] == version_id]
+    if not matches:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return matches[0]
+
+
+# ── Inline HTML fallback ───────────────────────────────────────────────────────
+def get_inline_html() -> str:
+    """Return the full single-page UI as a string (served if static/index.html missing)."""
+    return open(os.path.join(BASE_DIR, "static", "index.html")).read() \
+        if os.path.exists(os.path.join(BASE_DIR, "static", "index.html")) \
+        else "<h1>UI not built yet. Run: python build_ui.py</h1>"
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
